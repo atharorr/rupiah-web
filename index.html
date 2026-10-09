@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pengenal Rupiah">
+<title>Pengenal Rupiah</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #111; color: #fff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.4rem; margin: 0 0 12px; }
+  #stage { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; min-height: 200px; }
+  #video { display: block; width: 100%; height: auto; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #hasil { font-size: 2rem; font-weight: 700; margin: 16px 0 4px; min-height: 2.6rem; }
+  #status { font-size: 1rem; color: #aaa; margin: 0 0 16px; min-height: 1.4rem; }
+  button {
+    width: 100%; font-size: 1.4rem; font-weight: 700; padding: 18px;
+    border: 0; border-radius: 14px; background: #1f8f4e; color: #fff;
+  }
+  button:disabled { background: #444; color: #999; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pengenal Rupiah</h1>
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <p id="hasil" aria-live="assertive">Tekan Mulai</p>
+  <p id="status" aria-live="polite"></p>
+  <button id="mulai">Mulai</button>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script>
+// ===== Pengaturan =====
+const MODEL_URL = "best_v4.onnx";
+const WASM_BASE = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+const INPUT = 640;                      // harus sama dengan imgsz saat export
+const CLASSES = ["1000", "10000", "100000", "2000", "20000", "5000", "50000"]; // urutan = data.yaml
+const CONF = 0.6;                       // ambang kepercayaan
+const IOU = 0.5;                        // ambang NMS
+const STABLE = 3;                       // deteksi sama berturut-turut sebelum diucapkan
+const COOLDOWN = 3000;                  // ms sebelum nominal yang sama diucapkan lagi
+const UCAPAN = {
+  "1000": "seribu rupiah", "2000": "dua ribu rupiah", "5000": "lima ribu rupiah",
+  "10000": "sepuluh ribu rupiah", "20000": "dua puluh ribu rupiah",
+  "50000": "lima puluh ribu rupiah", "100000": "seratus ribu rupiah",
+};
+
+// ===== Fungsi inti (murni, mudah diuji) =====
+function iou(a, b) {
+  const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
+  const x2 = Math.min(a.x2, b.x2), y2 = Math.min(a.y2, b.y2);
+  const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  const ua = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter;
+  return ua <= 0 ? 0 : inter / ua;
+}
+
+function nms(boxes, thr) {
+  boxes.sort((p, q) => q.score - p.score);
+  const keep = [];
+  for (const b of boxes) {
+    if (keep.every(k => iou(k, b) < thr)) keep.push(b);
+  }
+  return keep;
+}
+
+// data: Float32Array bentuk [1, 4+nc, n]; hasil box dalam koordinat frame asli
+function decode(data, dims, scale, padX, padY, conf) {
+  const n = dims[2], nc = dims[1] - 4;
+  const boxes = [];
+  for (let i = 0; i < n; i++) {
+    let best = -1, bs = 0;
+    for (let c = 0; c < nc; c++) {
+      const s = data[(4 + c) * n + i];
+      if (s > bs) { bs = s; best = c; }
+    }
+    if (bs < conf) continue;
+    const cx = data[i], cy = data[n + i], w = data[2 * n + i], h = data[3 * n + i];
+    boxes.push({
+      x1: (cx - w / 2 - padX) / scale, y1: (cy - h / 2 - padY) / scale,
+      x2: (cx + w / 2 - padX) / scale, y2: (cy + h / 2 - padY) / scale,
+      score: bs, cls: best,
+    });
+  }
+  return nms(boxes, IOU);
+}
+
+// ===== Aplikasi =====
+ort.env.wasm.wasmPaths = WASM_BASE;
+ort.env.wasm.numThreads = 1;
+
+const video = document.getElementById("video");
+const overlay = document.getElementById("overlay");
+const octx = overlay.getContext("2d");
+const hasilEl = document.getElementById("hasil");
+const statusEl = document.getElementById("status");
+const btn = document.getElementById("mulai");
+
+const work = document.createElement("canvas");
+work.width = work.height = INPUT;
+const wctx = work.getContext("2d", { willReadFrequently: true });
+
+let session = null;
+let streak = 0, lastLabel = null, spoken = null, spokenAt = 0;
+
+function setStatus(t) { statusEl.textContent = t; }
+function rupiah(label) { return "Rp " + Number(label).toLocaleString("id-ID"); }
+
+function ucapkan(teks) {
+  if (!("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(teks);
+  u.lang = "id-ID";
+  u.rate = 0.9;
+  const v = speechSynthesis.getVoices().find(x => x.lang && x.lang.toLowerCase().startsWith("id"));
+  if (v) u.voice = v;
+  speechSynthesis.speak(u);
+}
+
+async function deteksi() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const scale = Math.min(INPUT / vw, INPUT / vh);
+  const nw = Math.round(vw * scale), nh = Math.round(vh * scale);
+  const padX = Math.floor((INPUT - nw) / 2), padY = Math.floor((INPUT - nh) / 2);
+
+  wctx.fillStyle = "rgb(114,114,114)";
+  wctx.fillRect(0, 0, INPUT, INPUT);
+  wctx.drawImage(video, 0, 0, vw, vh, padX, padY, nw, nh);
+  const px = wctx.getImageData(0, 0, INPUT, INPUT).data;
+
+  const area = INPUT * INPUT;
+  const input = new Float32Array(3 * area);
+  for (let i = 0, p = 0; i < area; i++, p += 4) {
+    input[i] = px[p] / 255;
+    input[area + i] = px[p + 1] / 255;
+    input[2 * area + i] = px[p + 2] / 255;
+  }
+
+  const tensor = new ort.Tensor("float32", input, [1, 3, INPUT, INPUT]);
+  const out = await session.run({ [session.inputNames[0]]: tensor });
+  const o = out[session.outputNames[0]];
+  return decode(o.data, o.dims, scale, padX, padY, CONF);
+}
+
+function gambar(dets) {
+  octx.clearRect(0, 0, overlay.width, overlay.height);
+  const lw = Math.max(3, overlay.width / 200);
+  const fs = Math.max(16, Math.round(overlay.width / 24));
+  octx.lineWidth = lw;
+  octx.font = `bold ${fs}px sans-serif`;
+  octx.textBaseline = "top";
+  for (const d of dets) {
+    const teks = `${rupiah(CLASSES[d.cls])} ${Math.round(d.score * 100)}%`;
+    octx.strokeStyle = "#2ee66b";
+    octx.strokeRect(d.x1, d.y1, d.x2 - d.x1, d.y2 - d.y1);
+    const tw = octx.measureText(teks).width + 10;
+    const ty = Math.max(0, d.y1 - fs - 6);
+    octx.fillStyle = "#2ee66b";
+    octx.fillRect(d.x1, ty, tw, fs + 6);
+    octx.fillStyle = "#000";
+    octx.fillText(teks, d.x1 + 5, ty + 3);
+  }
+}
+
+function proses(dets) {
+  if (!dets.length) {
+    streak = 0; lastLabel = null;
+    hasilEl.textContent = "Arahkan uang ke kamera";
+    return;
+  }
+  const top = dets[0];
+  const label = CLASSES[top.cls];
+  hasilEl.textContent = `${rupiah(label)} (${Math.round(top.score * 100)}%)`;
+  streak = label === lastLabel ? streak + 1 : 1;
+  lastLabel = label;
+  const now = performance.now();
+  if (streak >= STABLE && (label !== spoken || now - spokenAt > COOLDOWN)) {
+    ucapkan(UCAPAN[label] || (label + " rupiah"));
+    spoken = label; spokenAt = now;
+  }
+}
+
+async function loop() {
+  while (true) {
+    const t0 = performance.now();
+    try {
+      const dets = await deteksi();
+      gambar(dets);
+      proses(dets);
+      const ms = Math.round(performance.now() - t0);
+      setStatus(`Kecepatan: ${ms} ms per deteksi`);
+    } catch (e) {
+      setStatus("Error: " + e.message);
+      break;
+    }
+    await new Promise(r => setTimeout(r, 0));
+  }
+}
+
+btn.addEventListener("click", async () => {
+  btn.disabled = true;
+  ucapkan("Memuat model, mohon tunggu");   // membuka izin suara di iPhone
+  try {
+    setStatus("Memuat model...");
+    session = await ort.InferenceSession.create(MODEL_URL, {
+      executionProviders: ["wasm"], graphOptimizationLevel: "all",
+    });
+    setStatus("Membuka kamera...");
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    await new Promise(r => { if (video.readyState >= 1) r(); else video.onloadedmetadata = r; });
+    await video.play();
+    overlay.width = video.videoWidth;
+    overlay.height = video.videoHeight;
+    btn.textContent = "Sedang berjalan";
+    hasilEl.textContent = "Arahkan uang ke kamera";
+    ucapkan("Siap. Arahkan uang ke kamera.");
+    loop();
+  } catch (e) {
+    setStatus("Gagal: " + e.message);
+    hasilEl.textContent = "Gagal memulai";
+    btn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
